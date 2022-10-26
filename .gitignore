@@ -1,0 +1,12 @@
+# installed npm packages directory
+/node_modules
+
+# enviroment variables file
+.env
+
+# coverage directory used by solidity-coverage
+/coverage
+
+# hardhat stuff
+/artifacts
+/cache
