@@ -13,7 +13,8 @@ module.exports = async function (hre) {
     const interval = botConfig.interval
     const truflationOracleFee = networkConfig[chainId]['truflationOracleFee']
     const truflationOracleJobId = networkConfig[chainId]['truflationOracleJobId']
-    const args = [interval, truflationOracleFee, truflationOracleJobId]
+    const swapRouterAddress = '0xE592427A0AEce92De3Edee1F18E0157C05861564'
+    const args = [interval, truflationOracleFee, truflationOracleJobId, swapRouterAddress]
 
     // Actually deploy the contract
     const contract = await deploy('TradingBot', {
