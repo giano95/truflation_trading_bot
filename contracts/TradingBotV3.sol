@@ -10,6 +10,7 @@ import '@uniswap/v3-periphery/contracts/libraries/TransferHelper.sol';
 import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
 import '@chainlink/contracts/src/v0.8/ChainlinkClient.sol';
 import '@openzeppelin/contracts/token/ERC20/ERC20.sol';
+import './TruflationClient.sol';
 
 // -- INTERFACES --
 interface KeeperRegistrarInterface {
@@ -32,7 +33,6 @@ struct BotObj {
     uint256 orderSize;
     uint256 lastTimeStamp;
     uint256 counter; // count how many times we trade
-    uint256 maxNumberOfOrders;
 }
 
 function stringToBytes32(string memory source) pure returns (bytes32 result) {
@@ -59,13 +59,14 @@ function bytes32ToString(bytes32 _bytes32) pure returns (string memory) {
 }
 
 // -- CONTRACTS --
-contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
+contract TradingBotV3 is ReentrancyGuard, ChainlinkClient {
     using Counters for Counters.Counter;
     using Chainlink for Chainlink.Request;
 
     // -- CONSTANTS --
     uint24 public constant feeTier = 3000;
     uint8 public constant swapSlippage = 10; // 10%
+    uint256 public constant cacheInterval = 60 * 60 * 24; // 1 day
 
     // -- VARIABLES --
     Counters.Counter private _botIdCounter; // Counter ID
@@ -75,7 +76,7 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
     mapping(bytes32 => uint256) public requestIdToBotId;
 
     LinkTokenInterface public immutable i_link;
-    address public immutable registrar;
+    address public immutable i_registrar;
     AutomationRegistryInterface public immutable i_registry;
     bytes4 registerSig = KeeperRegistrarInterface.register.selector;
 
@@ -86,17 +87,16 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
     bytes32 public immutable i_tradedTokenSymbol;
     mapping(address => uint256) public stakingBalance;
     mapping(address => uint256) public tradingBalance;
+    mapping(address => uint256) public fundingBalance;
 
     bytes32 public immutable i_getPriceJobId;
     uint256 public immutable i_getPriceFee;
 
-    // for testing pourposes
-    uint256 public price;
-    string public lastError;
+    address public i_truflationOracle;
 
     // -- EVENTS --
     event FullfillPrice(bytes32 requestId, uint256 price);
-    event SwapTokensForTokens(address sender, address tokenIn, address tokenOut, uint amountIn, uint amountOutMinimum);
+    event SwapTokensForTokens(address sender, uint amountIn, uint amountOutMinimum);
     event ConcatenatedURL(string url);
 
     // -- ERRORS --
@@ -114,12 +114,13 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         address _tradedToken,
         address _chainlinkOracle,
         bytes32 _getPriceJobId,
-        uint256 _getPriceFee
+        uint256 _getPriceFee,
+        address _truflationOracle
     ) {
         // GOERLI: 0x326C977E6efc84E512bB9C30f76E30c160eD06FB
         i_link = _link;
         // GOERLI: 0x9806cf6fBc89aBF286e8140C42174B94836e36F2
-        registrar = _registrar;
+        i_registrar = _registrar;
         // GOERLI: 0x02777053d6764996e594c3E88AF1D58D5363a2e6
         i_registry = _registry;
 
@@ -137,14 +138,16 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         setChainlinkOracle(_chainlinkOracle);
         i_getPriceJobId = _getPriceJobId;
         i_getPriceFee = _getPriceFee;
+
+        // Truflation contract
+        i_truflationOracle = _truflationOracle;
     }
 
     // -- METHODS --
     function createNewBotInstance(
         address owner,
         uint256 orderInterval,
-        uint256 orderSize,
-        uint256 maxNumberOfOrders
+        uint256 orderSize
     ) public returns (uint256) {
         uint256 botId = _botIdCounter.current();
 
@@ -157,7 +160,6 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         botObj.orderSize = orderSize;
         botObj.lastTimeStamp = block.timestamp;
         botObj.counter = 0;
-        botObj.maxNumberOfOrders = maxNumberOfOrders;
         botIdToBotObj[botId] = botObj;
 
         return botId;
@@ -170,19 +172,16 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         uint256 orderInterval,
         uint256 orderSize
     ) public {
-        require(stakingBalance[msg.sender] > 0, 'Your staking balance is empty! Deposit some DAI first');
-        require(
-            stakingBalance[msg.sender] >= orderSize,
-            'Your orderSize is greater than your staking balance! Deposit more DAI'
-        );
-
-        uint256 maxNumberOfOrders = stakingBalance[msg.sender] / orderSize; // integer rounded down
+        require(fundingAmount >= 5000000000000000000, 'minimum fundingAmount is 5 LINK');
+        require(orderInterval >= 60, 'minimum orderInterval is 60 seconds');
+        require(orderSize >= 100000000000000, 'minimum orderSize is 0,0001 stakedToken');
+        require(fundingBalance[msg.sender] >= fundingAmount, 'your funding balance is < of your fundingAmount');
 
         (State memory state, Config memory _c, address[] memory _k) = i_registry.getState();
         uint256 oldNonce = state.nonce;
 
         // Create a new bot instance and pass his Id as the checkData
-        uint256 botId = createNewBotInstance(msg.sender, orderInterval, orderSize, maxNumberOfOrders);
+        uint256 botId = createNewBotInstance(msg.sender, orderInterval, orderSize);
         bytes memory checkData = abi.encodePacked(botId);
         bytes memory payload = abi.encode(
             name,
@@ -196,8 +195,11 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
             address(this)
         );
 
+        // Update the funds balance
+        fundingBalance[msg.sender] = fundingBalance[msg.sender] - fundingAmount;
+
         // Transfer Link and call the registrar
-        i_link.transferAndCall(registrar, fundingAmount, bytes.concat(registerSig, payload));
+        i_link.transferAndCall(i_registrar, fundingAmount, bytes.concat(registerSig, payload));
         (state, _c, _k) = i_registry.getState();
         uint256 newNonce = state.nonce;
 
@@ -213,14 +215,16 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
     }
 
     function checkConditions(uint256 botId) internal view returns (bool upkeepNeeded) {
-        bool isIntervalElapsed = (block.timestamp - botIdToBotObj[botId].lastTimeStamp) >
-            botIdToBotObj[botId].orderInterval;
+        BotObj memory botObj = botIdToBotObj[botId];
 
-        upkeepNeeded = isIntervalElapsed;
+        bool isIntervalElapsed = (block.timestamp - botObj.lastTimeStamp) > botObj.orderInterval;
+        bool isUserStakingBalanceZero = stakingBalance[botObj.owner] == 0;
+
+        upkeepNeeded = isIntervalElapsed && !isUserStakingBalanceZero;
     }
 
     function checkUpkeep(bytes calldata checkData) external view returns (bool upkeepNeeded, bytes memory performData) {
-        // decode the checkData
+        // decode the checkData and get the botId
         uint256 botId = abi.decode(checkData, (uint256));
 
         upkeepNeeded = checkConditions(botId);
@@ -242,28 +246,26 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         botObj.lastTimeStamp = block.timestamp;
         botObj.counter = botObj.counter + 1;
 
-        // TODO: BUY / SELL
+        // If the inflation is older update it
+        if ((block.timestamp - TruflationClient(i_truflationOracle).lastTimeStamp()) > cacheInterval) {
+            // approve truflation oracle to spend link
+            ERC20(address(i_link)).approve(i_truflationOracle, TruflationClient(i_truflationOracle).fee());
+
+            // Update the funds balance
+            fundingBalance[botObj.owner] = fundingBalance[botObj.owner] - TruflationClient(i_truflationOracle).fee();
+
+            // transfer and request inflation
+            TruflationClient(i_truflationOracle).transferAndRequestInflation();
+        }
+
+        // Update the funds balance
+        fundingBalance[botObj.owner] = fundingBalance[botObj.owner] - i_getPriceFee;
+
+        // Trade!
         requestPriceAndSwapToken(botId);
     }
 
-    function requestInflationData() public pure returns (uint256 yoyInflation) {
-        // // Create a Chainlink request to retrieve API response, find the target data
-        // Chainlink.Request memory req = buildChainlinkRequest(jobId, address(this), this.fulfill.selector);
-        // return sendChainlinkRequest(req, fee);
-        uint256 foo = 1;
-        return foo;
-    }
-
-    function requestConsumerSentimentData() public pure returns (uint256 consumerSentiment) {
-        // // Create a Chainlink request to retrieve API response, find the target data
-        // Chainlink.Request memory req = buildChainlinkRequest(jobId, address(this), this.fulfill.selector);
-        // return sendChainlinkRequest(req, fee);
-        uint256 foo = 1;
-        return foo;
-    }
-
     function stake(uint256 stakingAmount) public {
-        // stakingAmount must be > 0
         require(stakingAmount > 0, 'amount should be > 0');
 
         // Transfer the specified amount of DAI to this contract
@@ -277,7 +279,7 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         uint256 balance = stakingBalance[msg.sender];
 
         // Balance should be > 0
-        require(balance > 0, 'Your balance is 0, you have nothing to withdraw');
+        require(balance > 0, 'Your stake balance is 0, you have nothing to withdraw');
 
         // Reset staking balance
         stakingBalance[msg.sender] = 0;
@@ -286,38 +288,45 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         TransferHelper.safeTransfer(i_stakedToken, msg.sender, balance);
     }
 
+    function fund(uint256 fundingAmount) public {
+        require(fundingAmount > 0, 'amount should be > 0');
+
+        // Transfer the specified amount of LINK to this contract
+        TransferHelper.safeTransferFrom(address(i_link), msg.sender, address(this), fundingAmount);
+
+        // Update staking balance
+        fundingBalance[msg.sender] = fundingBalance[msg.sender] + fundingAmount;
+    }
+
+    function withdrawFunds() public nonReentrant {
+        uint256 balance = fundingBalance[msg.sender];
+
+        // Balance should be > 0
+        require(balance > 0, 'Your funding balance is 0, you have nothing to withdraw');
+
+        // Reset staking balance
+        fundingBalance[msg.sender] = 0;
+
+        // Transfer Dai tokens to the sender
+        TransferHelper.safeTransfer(address(i_link), msg.sender, balance);
+    }
+
     function swapTokensForTokens(
-        address sender,
-        address tokenIn,
-        address tokenOut,
+        address receiver,
         uint amountIn,
         uint amountOutMinimum
-    ) public returns (uint256 amountOut) {
-        emit SwapTokensForTokens(sender, tokenIn, tokenOut, amountIn, amountOutMinimum);
-
-        // The User staked tokens balance must me greater or equal of the amountIn
-        if (stakingBalance[sender] < amountIn) {
-            // require(stakingBalance[sender] >= amountIn, 'The sender does not have staked enough DAI');
-            lastError = 'The User does not have staked enough WETH';
-            return 0;
-        }
-
-        // The Contract staked tokens balance must me greater or equal of the amountIn
-        if (ERC20(i_stakedToken).balanceOf(address(this)) < amountIn) {
-            // require(stakingBalance[sender] >= amountIn, 'The sender does not have staked enough DAI');
-            lastError = 'The Contract does not have enough WETH';
-            return 0;
-        }
+    ) public {
+        emit SwapTokensForTokens(receiver, amountIn, amountOutMinimum);
 
         // Approve the router to spend DAI
-        TransferHelper.safeApprove(tokenIn, address(i_swapRouter), amountIn);
+        TransferHelper.safeApprove(i_stakedToken, address(i_swapRouter), amountIn);
 
         // Create the params that will be used to execute the swap
         ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-            tokenIn: tokenIn,
-            tokenOut: tokenOut,
+            tokenIn: i_stakedToken,
+            tokenOut: i_tradedToken,
             fee: feeTier,
-            recipient: sender,
+            recipient: receiver,
             deadline: block.timestamp,
             amountIn: amountIn,
             amountOutMinimum: amountOutMinimum,
@@ -325,20 +334,22 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         });
 
         // The call to `exactInputSingle` executes the swap
-        amountOut = i_swapRouter.exactInputSingle(params);
+        uint256 amountOut = i_swapRouter.exactInputSingle(params);
 
         // Update user balance
-        stakingBalance[sender] = stakingBalance[sender] - amountIn;
-        tradingBalance[sender] = tradingBalance[sender] + amountOut;
-
-        return amountOut;
+        stakingBalance[receiver] = stakingBalance[receiver] - amountIn;
+        tradingBalance[receiver] = tradingBalance[receiver] + amountOut;
     }
 
     function requestPriceAndSwapToken(uint256 botId) public returns (bytes32 requestId) {
         string memory fsyms = bytes32ToString(i_stakedTokenSymbol);
         string memory tsyms = bytes32ToString(i_tradedTokenSymbol);
 
-        Chainlink.Request memory req = buildChainlinkRequest(i_getPriceJobId, address(this), this.fulfill.selector);
+        Chainlink.Request memory req = buildChainlinkRequest(
+            i_getPriceJobId,
+            address(this),
+            this.fulfillPrice.selector
+        );
 
         // Set the URL to perform the GET request on
         req.add(
@@ -365,10 +376,9 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
         requestIdToBotId[requestId] = botId;
     }
 
-    function fulfill(bytes32 _requestId, uint256 _price) public recordChainlinkFulfillment(_requestId) {
+    function fulfillPrice(bytes32 _requestId, uint256 _price) public recordChainlinkFulfillment(_requestId) {
         // Emit and Event and set the price
         emit FullfillPrice(_requestId, _price);
-        price = _price;
 
         // Get the botId & the botObj associated with this price request
         uint256 botId = requestIdToBotId[_requestId];
@@ -376,22 +386,35 @@ contract TradingBotV2 is ReentrancyGuard, ChainlinkClient {
 
         // If the botObj is empty throw an error
         if (botObj.orderSize == 0) {
-            // revert NoCounterIDAssociated(_requestId);
-            lastError = 'NoCounterIDAssociated(_requestId)';
-            return;
+            revert NoCounterIDAssociated(_requestId);
         }
 
         // Calculate the minimum amount
         uint amountOut = (_price * botObj.orderSize) / 10**18;
         uint amountOutMinimum = amountOut - (amountOut * swapSlippage) / 100;
 
+        // Calculate order amount adjusted by the inflation (divide by 10^20 because it's a percentage)
+        int256 inflation = TruflationClient(i_truflationOracle).inflation();
+        uint256 orderAmount;
+        if (inflation > 0 && inflation < 50000000000000000000) /* positive and < 50% */
+        {
+            orderAmount = botObj.orderSize + ((botObj.orderSize * uint256(inflation)) / 10**20);
+        } else if (inflation < 0 && inflation > -50000000000000000000) /* negative and > -50% */
+        {
+            orderAmount = botObj.orderSize - ((botObj.orderSize * uint256(inflation)) / 10**20);
+        }
+        /* equal to zero or +-50% */
+        else {
+            orderAmount = botObj.orderSize;
+        }
+
+        // If the user has insufficient funds we use the maximum amount possible
+        if (stakingBalance[botObj.owner] < orderAmount) {
+            orderAmount = stakingBalance[botObj.owner];
+        }
+
         // Swap the tokens
-        swapTokensForTokens(
-            botObj.owner,
-            i_stakedToken,
-            i_tradedToken,
-            botObj.orderSize,
-            0 // we use 0 because in the testnet the price of the tokens doesn't actually reflect the real market
-        );
+        // we use 0 as 'amountOutMinimum' because in the testnet the price of the tokens doesn't actually reflect the real market
+        swapTokensForTokens(botObj.owner, orderAmount, 0);
     }
 }

@@ -1,6 +1,7 @@
 const { networkConfig, developmentChains } = require('../helper-hardhat-config')
 const { verify } = require('../utils/verify')
 require('../utils/prototype/array')
+const { waitNBlocks } = require('../utils/waitNBlocks')
 
 module.exports = async function (hre) {
     const { deployments, getNamedAccounts, network, config, ethers } = hre
@@ -11,11 +12,11 @@ module.exports = async function (hre) {
     const { deployer, user } = await getNamedAccounts()
 
     // Set the args
+    const link = networkConfig[chainId]['link']
     const oracleId = networkConfig[chainId]['oracleId']
     const jobId = networkConfig[chainId]['jobId']
     const fee = networkConfig[chainId]['fee']
-    const token = networkConfig[chainId]['token']
-    const args = [oracleId, jobId, fee, token]
+    const args = [link, oracleId, jobId, fee]
 
     // if we haven't set the args for this network pass
     if (args.haveNull()) {
@@ -24,7 +25,7 @@ module.exports = async function (hre) {
     }
 
     // Actually deploy the contract
-    const contract = await deploy('TruflationTester', {
+    const contract = await deploy('TruflationClient', {
         from: deployer,
         args: args,
         log: true,
@@ -33,9 +34,10 @@ module.exports = async function (hre) {
 
     // Verify the deployment
     if (!developmentChains.includes(network.name) && config.etherscan.apiKey[network.name]) {
+        await waitNBlocks(3)
         console.log('Verifying...')
         await verify(contract.address, args)
     }
 }
 
-module.exports.tags = ['all', 'truflation-tester']
+module.exports.tags = ['all', 'truflation-client']

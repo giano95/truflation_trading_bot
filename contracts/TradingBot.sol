@@ -34,6 +34,7 @@ contract TradingBot is AutomationCompatibleInterface, ChainlinkClient, Reentranc
 
     // -- CONSTRUCTOR --
     constructor(
+        uint256 interval,
         uint256 truflationOracleFee,
         bytes32 truflationOracleJobId,
         ISwapRouter swapRouter
